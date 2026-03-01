@@ -13,19 +13,11 @@
 #define PAYLOAD_BITS (24 * 8) // 3 doubles
 
 // Global state for the decoder
-float complex filter0, filter1;
 int bit_sample_count = 0;
 uint64_t shift_reg = 0; // To detect preamble 0xAAAAAAAA
 int decoding_active = 0;
 int bit_idx = 0;
 uint8_t rx_buffer[24];
-
-void init_filters() {
-    // Pre-calculate the "reference" phasor for the bit duration
-    // Using a simplified single-point correlation for speed
-    filter0 = cexpf(-I * 2.0f * M_PI * F_OFFSET / SAMPLE_RATE);
-    filter1 = cexpf(-I * 2.0f * M_PI * -F_OFFSET / SAMPLE_RATE);
-}
 
 int rx_callback(hackrf_transfer* transfer) {
     int8_t* buffer = (int8_t*)transfer->buffer;
