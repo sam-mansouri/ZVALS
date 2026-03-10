@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2025 Nordic Semiconductor ASA
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ *
+ * nRF54L15-DK overlay for CS Reflector + SPI output
+ *
+ * SPI00 pin mapping (Arduino header):
+ *   SCK  → P2.06  (D13)
+ *   MOSI → P2.04  (D11)
+ *   MISO → P2.05  (D12)
+ *   CS   → P2.07  (D10)  GPIO CS, active low
+ */
+
+/ {
+	cs_antenna_switch: cs-antenna-config {
+		status = "okay";
+		compatible = "nordic,bt-cs-antenna-switch";
+		ant-gpios = <&gpio1 11 (GPIO_ACTIVE_HIGH)>,
+			    <&gpio1 12 (GPIO_ACTIVE_HIGH)>,
+			    <&gpio1 13 (GPIO_ACTIVE_HIGH)>,
+			    <&gpio1 14 (GPIO_ACTIVE_HIGH)>;
+		multiplexing-mode = <0>;
+	};
+};
+
+/* Use spi21 instead of spi00 — no HFXO dependency */
+&spi21 {
+    status = "okay";
+    pinctrl-0 = <&spi21_default>;
+    pinctrl-1 = <&spi21_sleep>;
+    pinctrl-names = "default", "sleep";
+    cs-gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+};
+
+&pinctrl {
+    spi21_default: spi21_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK,  2, 6)>,
+                    <NRF_PSEL(SPIM_MOSI, 2, 4)>,
+                    <NRF_PSEL(SPIM_MISO, 2, 5)>;
+        };
+    };
+    spi21_sleep: spi21_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK,  2, 6)>,
+                    <NRF_PSEL(SPIM_MOSI, 2, 4)>,
+                    <NRF_PSEL(SPIM_MISO, 2, 5)>;
+            low-power-enable;
+        };
+    };
+};
