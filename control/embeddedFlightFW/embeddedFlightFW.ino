@@ -10,9 +10,12 @@ HardwareSerial nrfSerial(PA_10, PA_9);
 static const double ANCHOR_X[] = {0.0, 20.0, 0.0};
 static const double ANCHOR_Y[] = {0.0, 0.0, 20.0};
 
+/* ── Sensor packet ───────────────────────────────────────────────────────
+ * Distances parsed from the nRF Zephyr LOG_INF text line, in metres.    */
 struct SensorPacket {
-  uint8_t stationId[3];
-  int32_t distance[3];
+  float ifft_m;
+  float phase_m;
+  float rtt_m;
 };
 
 struct FlightCommand {
@@ -23,26 +26,19 @@ struct FlightCommand {
 
 static QueueHandle_t sensorQueue;
 static QueueHandle_t commandQueue;
+static volatile bool armed = false;
 
-/* ── UART frame format (17 bytes) ────────────────────────────────────────
- *   [0]      0xAA  start marker
- *   [1..15]  15-byte payload:
- *              byte 0       station ID  (board 1)
- *              bytes 1..4   distance cm (board 1, big-endian int32)
- *              byte 5       station ID  (board 2)
- *              bytes 6..9   distance cm (board 2, big-endian int32)
- *              byte 10      station ID  (board 3)
- *              bytes 11..14 distance cm (board 3, big-endian int32)
- *   [16]     0x55  end marker
+/* ── UART text format (Zephyr LOG_INF) ───────────────────────────────────
+ * The nRF board outputs one log line per ranging event on uart21 TX (P1.04):
  *
- * nRF UART: uart20, 115200 baud
+ *   "I: path=<n>  ifft=<f>m  phase_slope=<f>m  rtt=<f>m\r\n"
+ *
+ * Values are in metres with 3 decimal places.
+ * nRF UART: uart21, TX = P1.04, 115200 baud
  * STM32 RX pin: PA10 (USART1)
  * ─────────────────────────────────────────────────────────────────────── */
 
-#define UART_FRAME_LEN  17
-#define PAYLOAD_LEN     15
-#define FRAME_START     0xAA
-#define FRAME_END       0x55
+#define LINE_BUF_LEN 160 /* longer than the longest expected log line */
 
 /* ── CRC / CRSF ──────────────────────────────────────────────────────── */
 uint8_t crc8(const uint8_t *ptr, uint8_t len) {
@@ -55,7 +51,7 @@ uint8_t crc8(const uint8_t *ptr, uint8_t len) {
   return crc;
 }
 
-uint16_t stickToCRSF(float value) { return 992 + (uint16_t)(value * 500.0f); }
+uint16_t stickToCRSF(float value) { return 992 + (uint16_t)(value * 150.0f); }
 
 void sendCRSF(const FlightCommand &cmd) {
   uint8_t packet[26];
@@ -68,8 +64,8 @@ void sendCRSF(const FlightCommand &cmd) {
   channels[1] = stickToCRSF(cmd.pitch);
   channels[2] = cmd.throttle;
   channels[3] = 992;
-  channels[4] = 992; /* TODO: arming logic */
-  channels[5] = 992;
+  channels[4] = armed ? 1811 : 992;
+  channels[5] = armed ? 1811 : 992;
   for (int i = 6; i < 16; i++)
     channels[i] = 992;
 
@@ -89,98 +85,82 @@ void sendCRSF(const FlightCommand &cmd) {
   crsfSerial.write(packet, 26);
 }
 
-/* ── Frame parser ────────────────────────────────────────────────────── */
-static bool parseFrame(const uint8_t *raw, SensorPacket &pkt) {
-  if (raw[0] != FRAME_START || raw[UART_FRAME_LEN - 1] != FRAME_END) {
-    Serial.print("[UART] Bad markers — got 0x");
-    Serial.print(raw[0], HEX);
-    Serial.print(" / 0x");
-    Serial.println(raw[UART_FRAME_LEN - 1], HEX);
+/* ── Line parser ─────────────────────────────────────────────────────────
+ * Searches for "ifft=", "phase_slope=", "rtt=" key=value pairs anywhere
+ * in the line.  strtof() stops cleanly at the trailing 'm' unit suffix. */
+static bool parseLine(const char *line, SensorPacket &pkt) {
+  const char *p;
+
+  p = strstr(line, "ifft=");
+  if (!p)
     return false;
-  }
-  const uint8_t *p = &raw[1];
-  for (int i = 0; i < 3; i++) {
-    pkt.stationId[i] = p[i * 5];
-    pkt.distance[i] =
-        (int32_t)((uint32_t)p[i * 5 + 1] << 24 | (uint32_t)p[i * 5 + 2] << 16 |
-                  (uint32_t)p[i * 5 + 3] << 8  | (uint32_t)p[i * 5 + 4]);
-  }
+  pkt.ifft_m = strtof(p + 5, NULL);
+
+  p = strstr(line, "phase_slope=");
+  if (!p)
+    return false;
+  pkt.phase_m = strtof(p + 12, NULL);
+
+  p = strstr(line, "rtt=");
+  if (!p)
+    return false;
+  pkt.rtt_m = strtof(p + 4, NULL);
+
   return true;
 }
 
 /* ── FreeRTOS tasks ──────────────────────────────────────────────────── */
 void taskUartRead(void *pvParameters) {
-  enum { WAIT_HEADER, READ_PAYLOAD, READ_FOOTER } state = WAIT_HEADER;
-  uint8_t buf[UART_FRAME_LEN];
-  uint8_t idx = 0;
+  char lineBuf[LINE_BUF_LEN];
+  uint8_t lineLen = 0;
   SensorPacket pkt;
-  static uint32_t frameCount   = 0;
-  static uint32_t badFrameCount = 0;
-
-  Serial.println("[UART] Task started");
-
+  static uint32_t packetCount = 0;
   static uint32_t byteCount = 0;
   static uint32_t lastReport = 0;
+
+  Serial.println("[UART] Task started (text parser)");
 
   for (;;) {
     uint32_t now = xTaskGetTickCount();
     if (now - lastReport >= 2000) {
       lastReport = now;
-      Serial.print("[UART] Raw bytes received so far: "); Serial.println(byteCount);
+      Serial.print("[UART] Bytes: ");
+      Serial.print(byteCount);
+      Serial.print("  Packets: ");
+      Serial.println(packetCount);
     }
 
     while (nrfSerial.available()) {
-      uint8_t b = (uint8_t)nrfSerial.read();
+      char c = (char)nrfSerial.read();
       byteCount++;
 
-      switch (state) {
-        case WAIT_HEADER:
-          if (b == FRAME_START) {
-            buf[0] = b;
-            idx    = 1;
-            state  = READ_PAYLOAD;
-          } else {
-            Serial.print("[UART] Unexpected byte while seeking header: 0x");
-            Serial.println(b, HEX);
+      if (c == '\n') {
+        lineBuf[lineLen] = '\0';
+
+        if (parseLine(lineBuf, pkt)) {
+          packetCount++;
+          xQueueOverwrite(sensorQueue, &pkt);
+
+          if (packetCount % 5 == 1) {
+            Serial.print("[UART] #");
+            Serial.print(packetCount);
+            Serial.print("  ifft=");
+            Serial.print(pkt.ifft_m, 3);
+            Serial.print("m  phase=");
+            Serial.print(pkt.phase_m, 3);
+            Serial.print("m  rtt=");
+            Serial.print(pkt.rtt_m, 3);
+            Serial.println("m");
           }
-          break;
+        }
+        lineLen = 0;
 
-        case READ_PAYLOAD:
-          buf[idx++] = b;
-          if (idx == UART_FRAME_LEN - 1)
-            state = READ_FOOTER;
-          break;
-
-        case READ_FOOTER:
-          buf[idx] = b;
-          state    = WAIT_HEADER;
-
-          if (parseFrame(buf, pkt)) {
-            frameCount++;
-            xQueueOverwrite(sensorQueue, &pkt);
-
-            if (frameCount % 10 == 1) {
-              Serial.print("[UART] Frame #"); Serial.print(frameCount);
-              Serial.print("  IDs: ");
-              Serial.print(pkt.stationId[0]); Serial.print(" ");
-              Serial.print(pkt.stationId[1]); Serial.print(" ");
-              Serial.println(pkt.stationId[2]);
-              Serial.print("       Distances (cm): ");
-              Serial.print(pkt.distance[0]); Serial.print("  ");
-              Serial.print(pkt.distance[1]); Serial.print("  ");
-              Serial.println(pkt.distance[2]);
-              Serial.print("       Raw hex: ");
-              for (int i = 0; i < UART_FRAME_LEN; i++) {
-                if (buf[i] < 0x10) Serial.print("0");
-                Serial.print(buf[i], HEX); Serial.print(" ");
-              }
-              Serial.println();
-            }
-          } else {
-            badFrameCount++;
-            Serial.print("[UART] Bad frame #"); Serial.println(badFrameCount);
-          }
-          break;
+      } else if (c != '\r') {
+        if (lineLen < LINE_BUF_LEN - 1) {
+          lineBuf[lineLen++] = c;
+        } else {
+          lineLen = 0; /* line too long — discard and resync */
+        }
       }
     }
 
@@ -204,10 +184,10 @@ void taskControl(void *pvParameters) {
 
   for (;;) {
     if (xQueueReceive(sensorQueue, &pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
-      /* TODO: verify station ID mapping */
-      droneController_U.In2 = (double)pkt.distance[0];
-      droneController_U.In4 = (double)pkt.distance[1];
-      droneController_U.In5 = (double)pkt.distance[2];
+      /* Values already in metres — pass directly to controller */
+      droneController_U.In2 = (double)pkt.ifft_m;
+      droneController_U.In4 = (double)pkt.phase_m;
+      droneController_U.In5 = (double)pkt.rtt_m;
       droneController_step();
       stepCount++;
 
@@ -219,17 +199,28 @@ void taskControl(void *pvParameters) {
       xQueueOverwrite(commandQueue, &cmd);
 
       if (stepCount % 5 == 1) {
-        Serial.print("[CTL ] Step #"); Serial.println(stepCount);
-        Serial.print("       In2="); Serial.print(droneController_U.In2);
-        Serial.print("  In4="); Serial.print(droneController_U.In4);
-        Serial.print("  In5="); Serial.println(droneController_U.In5);
-        Serial.print("       vx="); Serial.print(droneController_Y.vx);
-        Serial.print("  vy="); Serial.print(droneController_Y.vy);
-        Serial.print("  vz="); Serial.print(droneController_Y.vz);
-        Serial.print("  enableZ="); Serial.println(droneController_Y.enableZ);
-        Serial.print("       roll="); Serial.print(cmd.roll);
-        Serial.print("  pitch="); Serial.print(cmd.pitch);
-        Serial.print("  throttle="); Serial.println(cmd.throttle);
+        Serial.print("[CTL ] Step #");
+        Serial.println(stepCount);
+        Serial.print("       ifft=");
+        Serial.print(droneController_U.In2, 3);
+        Serial.print("m  phase=");
+        Serial.print(droneController_U.In4, 3);
+        Serial.print("m  rtt=");
+        Serial.println(droneController_U.In5, 3);
+        Serial.print("       vx=");
+        Serial.print(droneController_Y.vx, 3);
+        Serial.print("  vy=");
+        Serial.print(droneController_Y.vy, 3);
+        Serial.print("  vz=");
+        Serial.print(droneController_Y.vz, 3);
+        Serial.print("  enableZ=");
+        Serial.println(droneController_Y.enableZ);
+        Serial.print("       roll=");
+        Serial.print(cmd.roll);
+        Serial.print("  pitch=");
+        Serial.print(cmd.pitch);
+        Serial.print("  throttle=");
+        Serial.println(cmd.throttle);
       }
     }
   }
@@ -238,20 +229,38 @@ void taskControl(void *pvParameters) {
 void taskCrsfSend(void *pvParameters) {
   FlightCommand cmd = {0.0f, 0.0f, 172};
   static uint32_t sendCount = 0;
+  const uint32_t ARM_DELAY_MS = 5000;
+  uint32_t startTick = xTaskGetTickCount();
 
-  Serial.println("[CRSF] Task started");
+  Serial.println("[CRSF] Task started — will auto-arm in 5s");
 
   for (;;) {
+    if (!armed &&
+        (xTaskGetTickCount() - startTick) >= pdMS_TO_TICKS(ARM_DELAY_MS)) {
+      armed = true;
+      cmd.throttle = 172;
+      Serial.println("[CRSF] AUTO-ARMED — throttle at minimum");
+    }
+
     bool gotCmd = xQueueReceive(commandQueue, &cmd, 0) == pdTRUE;
+    if (!armed)
+      cmd.throttle = 172;
+    // TODO: remove hardcoded throttle
+    // cmd.throttle = 500;
     sendCRSF(cmd);
     sendCount++;
 
     if (sendCount % 50 == 1) {
-      Serial.print("[CRSF] Packet #"); Serial.print(sendCount);
+      Serial.print("[CRSF] Packet #");
+      Serial.print(sendCount);
+      Serial.print(armed ? "  [ARMED]" : "  [DISARMED]");
       Serial.print(gotCmd ? "  (live)" : "  (stale)");
-      Serial.print("  roll="); Serial.print(stickToCRSF(cmd.roll));
-      Serial.print("  pitch="); Serial.print(stickToCRSF(cmd.pitch));
-      Serial.print("  thr="); Serial.println(cmd.throttle);
+      Serial.print("  roll=");
+      Serial.print(stickToCRSF(cmd.roll));
+      Serial.print("  pitch=");
+      Serial.print(stickToCRSF(cmd.pitch));
+      Serial.print("  thr=");
+      Serial.println(cmd.throttle);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -261,7 +270,8 @@ void taskCrsfSend(void *pvParameters) {
 /* ── Setup ───────────────────────────────────────────────────────────── */
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
   Serial.println("[INIT] Booting...");
 
   crsfSerial.begin(420000);
@@ -276,13 +286,13 @@ void setup() {
   droneController_initialize();
   Serial.println("[INIT] Controller initialized");
 
-  sensorQueue  = xQueueCreate(1, sizeof(SensorPacket));
+  sensorQueue = xQueueCreate(1, sizeof(SensorPacket));
   commandQueue = xQueueCreate(1, sizeof(FlightCommand));
   Serial.println("[INIT] Queues created");
 
-  xTaskCreate(taskUartRead,  "UART", 512, NULL, 3, NULL);
-  xTaskCreate(taskControl,   "CTL",  512, NULL, 2, NULL);
-  xTaskCreate(taskCrsfSend,  "CRSF", 256, NULL, 1, NULL);
+  xTaskCreate(taskUartRead, "UART", 512, NULL, 3, NULL);
+  xTaskCreate(taskControl, "CTL", 512, NULL, 2, NULL);
+  xTaskCreate(taskCrsfSend, "CRSF", 256, NULL, 1, NULL);
   Serial.println("[INIT] Tasks created — starting scheduler");
 
   vTaskStartScheduler();
